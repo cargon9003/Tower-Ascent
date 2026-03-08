@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Tower Ascent</title>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 100%; height: 100%;
+  background: #06000f;
+  display: flex; justify-content: center; align-items: center;
+  overflow: hidden; touch-action: none;
+  font-family: 'Cinzel', serif;
+}
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ─── SETUP ────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = 390, H = 700;
+canvas.width = W; canvas.height = H;
+
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width  = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+}
+fit(); window.addEventListener('resize', fit);
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const GRAVITY    = 0.45;
+const JUMP_VEL   = -13;
+const MOVE_SPD   = 4;
+const MAX_FALL   = 15;
+const WORLD_H    = 5200;
+const TL = 40, TR = W - 40;       // tower left/right walls
+const TW = TR - TL;
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let state      = 'menu';
+let difficulty = 'normal';
+let tick       = 0;
+
+// ─── WORLD ────────────────────────────────────────────────────────────────────
+let platforms = [], stars = [];
+
+function seed(n) { let x = Math.sin(n+1)*10000; return x - Math.floor(x); }
+
+function genWorld() {
+  platforms = [];
+  // Ground
+  platforms.push({ x: TL, y: WORLD_H - 40, w: TW, h: 22, type: 'ground' });
+
+  // Ascending platforms - seeded so same layout every time
+  let y = WORLD_H - 135;
+  for (let i = 0; i < 65; i++) {
+    const w  = 72 + seed(i*3)   * 68;
+    const x  = TL + seed(i*3+1) * (TW - w);
+    const isCP = difficulty === 'normal' && (i+1) % 12 === 0;
+    platforms.push({ x, y, w, h: 14, type: isCP ? 'cp' : 'normal', lit: false });
+    y -= 62 + seed(i*3+2) * 32;
+  }
+  // Apex
+  platforms.push({ x: W/2 - 75, y: 55, w: 150, h: 20, type: 'apex' });
+
+  // Stars
+  stars = [];
+  for (let i = 0; i < 220; i++) {
+    stars.push({
+      x: TL + seed(i)*TW,
+      y: seed(i+500)*WORLD_H,
+      r: seed(i+1000)*1.4 + 0.3,
+      t: seed(i+2000)*Math.PI*2
+    });
+  }
+}
+
+// ─── PLAYER ───────────────────────────────────────────────────────────────────
+const PW = 22, PH = 30;
+let p = {}, camY = 0, lastCP = null;
+
+function resetPlayer() {
+  p = { x: W/2 - PW/2, y: WORLD_H - 72, vx: 0, vy: 0, onGround: false, facing: 1, glow: 0 };
+  camY   = WORLD_H - H;
+  lastCP = null;
+  for (const pl of platforms) pl.lit = false;
+}
+
+// ─── INPUT ────────────────────────────────────────────────────────────────────
+const K = { left: false, right: false, up: false };
+const T = { left: false, right: false, jump: false };
+let prevJump = false;
+
+document.addEventListener('keydown', e => {
+  if (['ArrowLeft','a','A'].includes(e.key))  K.left  = true;
+  if (['ArrowRight','d','D'].includes(e.key)) K.right = true;
+  if (['ArrowUp','w','W',' '].includes(e.key)) { K.up = true; if (state === 'menu') startGame(); }
+  if (['ArrowLeft','ArrowRight','ArrowUp',' '].includes(e.key)) e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  if (['ArrowLeft','a','A'].includes(e.key))  K.left  = false;
+  if (['ArrowRight','d','D'].includes(e.key)) K.right = false;
+  if (['ArrowUp','w','W',' '].includes(e.key)) K.up   = false;
+});
+
+// Touch buttons layout
+const TB = {
+  left:  { x: 18,      y: H - 88, w: 66, h: 66 },
+  right: { x: 100,     y: H - 88, w: 66, h: 66 },
+  jump:  { x: W - 90,  y: H - 88, w: 66, h: 66 },
+};
+
+function cp(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+}
+function inBox(pt, b) { return pt.x>=b.x && pt.x<=b.x+b.w && pt.y>=b.y && pt.y<=b.y+b.h; }
+
+let activeT = {};
+function updateTouch() {
+  T.left = T.right = T.jump = false;
+  for (const id in activeT) {
+    if (inBox(activeT[id], TB.left))  T.left  = true;
+    if (inBox(activeT[id], TB.right)) T.right = true;
+    if (inBox(activeT[id], TB.jump))  T.jump  = true;
+  }
+}
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) activeT[t.identifier] = cp(t);
+  updateTouch();
+  if (state === 'menu') {
+    for (const id in activeT) handleMenuTap(activeT[id]);
+  }
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) activeT[t.identifier] = cp(t);
+  updateTouch();
+}, { passive: false });
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) delete activeT[t.identifier];
+  updateTouch();
+}, { passive: false });
+
+// ─── PHYSICS ──────────────────────────────────────────────────────────────────
+function update() {
+  if (state !== 'playing') return;
+
+  const goL  = K.left  || T.left;
+  const goR  = K.right || T.right;
+  const jump = K.up    || T.jump;
+
+  p.vx = goL ? -MOVE_SPD : goR ? MOVE_SPD : 0;
+  if (goL) p.facing = -1; if (goR) p.facing = 1;
+
+  if (jump && !prevJump && p.onGround) {
+    p.vy   = JUMP_VEL;
+    p.glow = 1;
+    p.onGround = false;
+  }
+  prevJump = jump;
+
+  p.vy += GRAVITY;
+  if (p.vy > MAX_FALL) p.vy = MAX_FALL;
+  p.x += p.vx;
+  p.y += p.vy;
+
+  // Wall clamp
+  if (p.x < TL)       p.x = TL;
+  if (p.x + PW > TR)  p.x = TR - PW;
+
+  // Platform collision (top-surface only, while falling)
+  p.onGround = false;
+  if (p.vy >= 0) {
+    const prevBot = p.y + PH - p.vy;
+    const currBot = p.y + PH;
+    for (const pl of platforms) {
+      if (currBot >= pl.y && prevBot <= pl.y &&
+          p.x + PW > pl.x && p.x < pl.x + pl.w) {
+        p.y  = pl.y - PH;
+        p.vy = 0;
+        p.onGround = true;
+        if (pl.type === 'cp' && !pl.lit) { pl.lit = true; lastCP = pl; }
+        if (pl.type === 'apex')          { state = 'win'; }
+        break;
+      }
+    }
+  }
+
+  // Fell out
+  if (p.y > WORLD_H + 60) {
+    if (difficulty === 'normal' && lastCP) {
+      p.x = lastCP.x + lastCP.w/2 - PW/2;
+      p.y = lastCP.y - PH - 2;
+    } else {
+      p.x = W/2 - PW/2;
+      p.y = WORLD_H - 72;
+    }
+    p.vx = p.vy = 0;
+  }
+
+  // Camera
+  const tgt = p.y - H * 0.38;
+  camY += (tgt - camY) * 0.09;
+  camY = Math.max(0, Math.min(WORLD_H - H, camY));
+
+  if (p.glow > 0) p.glow -= 0.03;
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+function sw(wy) { return wy - camY; }
+
+function glow(color, blur) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
+function noGlow()           { ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; }
+
+function rr(x, y, w, h, r) {
+  if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); return; }
+  ctx.rect(x, y, w, h);
+}
+
+// ─── RENDER ───────────────────────────────────────────────────────────────────
+function drawBG() {
+  // Sky
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0c0020'); g.addColorStop(1, '#09001a');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // Walls
+  ctx.fillStyle = '#110230'; ctx.fillRect(0, 0, TL, H);
+  ctx.fillStyle = '#110230'; ctx.fillRect(TR, 0, W - TR, H);
+
+  // Stone courses
+  ctx.strokeStyle = '#1d0545'; ctx.lineWidth = 1;
+  for (let wy = Math.floor(camY/28)*28; wy < camY + H + 28; wy += 28) {
+    const sy = sw(wy);
+    ctx.beginPath();
+    ctx.moveTo(0, sy);    ctx.lineTo(TL - 1, sy);
+    ctx.moveTo(TR + 1, sy); ctx.lineTo(W, sy);
+    ctx.stroke();
+  }
+
+  // Stars (twinkle)
+  for (const s of stars) {
+    const sy = sw(s.y);
+    if (sy < -5 || sy > H + 5) continue;
+    const a = 0.35 + 0.55 * Math.abs(Math.sin(tick * 0.018 + s.t));
+    ctx.fillStyle = `rgba(210,185,255,${a.toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(s.x, sy, s.r, 0, Math.PI*2); ctx.fill();
+  }
+
+  // Subtle top glow at apex
+  const apexSY = sw(30);
+  if (apexSY > -100 && apexSY < H + 100) {
+    const ag = ctx.createRadialGradient(W/2, apexSY, 0, W/2, apexSY, 120);
+    ag.addColorStop(0, 'rgba(168,85,247,0.25)');
+    ag.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = ag; ctx.fillRect(0, apexSY - 120, W, 240);
+  }
+}
+
+function drawPlatforms() {
+  for (const pl of platforms) {
+    const sy = sw(pl.y);
+    if (sy > H + 30 || sy < -40) continue;
+
+    ctx.save();
+    let fill, shadowC, shadowB;
+
+    if (pl.type === 'ground') {
+      fill = '#2e0d60'; shadowC = '#7c3aed'; shadowB = 10;
+    } else if (pl.type === 'cp') {
+      const pulse = 0.8 + 0.2 * Math.sin(tick * 0.07);
+      fill    = pl.lit ? '#7a5c0a' : '#c8920e';
+      shadowC = pl.lit ? '#a07010' : `rgba(255,195,0,${pulse})`;
+      shadowB = pl.lit ? 8 : 22;
+    } else if (pl.type === 'apex') {
+      const pulse = 0.5 + 0.5 * Math.sin(tick * 0.045);
+      fill    = '#e9d5ff';
+      shadowC = `rgba(216,180,254,${pulse})`;
+      shadowB = 35;
+    } else {
+      fill    = '#4c1d95';
+      shadowC = '#7c3aed';
+      shadowB = 12;
+    }
+
+    glow(shadowC, shadowB);
+    const gr = ctx.createLinearGradient(pl.x, sy, pl.x, sy + pl.h);
+    gr.addColorStop(0, fill);
+    gr.addColorStop(1, '#1e0040');
+    ctx.fillStyle = gr;
+    ctx.beginPath(); rr(pl.x, sy, pl.w, pl.h, 4); ctx.fill();
+
+    // Highlight stripe
+    noGlow();
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(pl.x + 4, sy + 1, pl.w - 8, 3);
+
+    // Labels
+    if (pl.type === 'cp') {
+      ctx.fillStyle = pl.lit ? '#b8860b' : '#ffd700';
+      ctx.font = 'bold 8px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('✦ CHECKPOINT ✦', pl.x + pl.w/2, sy - 4);
+    }
+    if (pl.type === 'apex') {
+      ctx.fillStyle = '#e9d5ff'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'center';
+      ctx.fillText('⚜  A P E X  ⚜', pl.x + pl.w/2, sy - 6);
+    }
+    ctx.restore();
+  }
+}
+
+function drawPlayer() {
+  const sx = p.x, sy = sw(p.y);
+  ctx.save();
+
+  // Cloak glow
+  const glowAmt = p.glow > 0 ? p.glow : (p.onGround ? 0.15 : 0.4);
+  glow('#a855f7', 18 * glowAmt);
+
+  // Cloak / body
+  ctx.fillStyle = '#7c3aed';
+  ctx.beginPath();
+  ctx.moveTo(sx + 2, sy + PH);
+  ctx.lineTo(sx + PW - 2, sy + PH);
+  ctx.lineTo(sx + PW - 1, sy + 12);
+  ctx.lineTo(sx + PW/2, sy + 10);
+  ctx.lineTo(sx + 1, sy + 12);
+  ctx.closePath(); ctx.fill();
+
+  // Inner robe
+  ctx.fillStyle = '#4c1d95';
+  ctx.fillRect(sx + 6, sy + 13, PW - 12, PH - 14);
+
+  // Head
+  glow('#c4b5fd', 10);
+  ctx.fillStyle = '#ddd6fe';
+  ctx.beginPath(); ctx.arc(sx + PW/2, sy + 8, 7, 0, Math.PI*2); ctx.fill();
+
+  // Wizard hat
+  glow('#7c3aed', 12);
+  ctx.fillStyle = '#5b21b6';
+  ctx.beginPath();
+  ctx.moveTo(sx + 3, sy + 4);
+  ctx.lineTo(sx + PW/2, sy - 11);
+  ctx.lineTo(sx + PW - 3, sy + 4);
+  ctx.closePath(); ctx.fill();
+
+  // Hat brim highlight
+  ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(sx + 3, sy + 4); ctx.lineTo(sx + PW - 3, sy + 4); ctx.stroke();
+
+  // Eyes
+  noGlow();
+  ctx.fillStyle = '#1e1b4b';
+  const eo = p.facing * 1.5;
+  ctx.fillRect(sx + PW/2 + eo - 3, sy + 5, 2, 2);
+  ctx.fillRect(sx + PW/2 + eo + 1, sy + 5, 2, 2);
+
+  // Staff
+  const sfx = sx + (p.facing > 0 ? PW + 1 : -5);
+  glow('#a855f7', 10);
+  ctx.strokeStyle = '#8b5cf6'; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(sfx, sy + 14); ctx.lineTo(sfx + p.facing * (-3), sy + PH + 2); ctx.stroke();
+
+  // Orb
+  const pulse = 0.7 + 0.3 * Math.sin(tick * 0.12);
+  ctx.fillStyle = `rgba(192,132,252,${pulse})`;
+  glow('#c084fc', 15);
+  ctx.beginPath(); ctx.arc(sfx, sy + 13, 3.5, 0, Math.PI*2); ctx.fill();
+
+  ctx.restore();
+}
+
+function drawHUD() {
+  // Height bar
+  const prog = Math.max(0, Math.min(1, 1 - p.y / WORLD_H));
+  const bh = 180, bx = W - 22, by = (H - bh)/2;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.beginPath(); rr(bx - 2, by - 2, 12, bh + 4, 4); ctx.fill();
+
+  const bg = ctx.createLinearGradient(0, by + bh, 0, by);
+  bg.addColorStop(0, '#4c1d95'); bg.addColorStop(1, '#d8b4fe');
+  ctx.fillStyle = bg;
+  const filled = bh * prog;
+  ctx.fillRect(bx, by + bh - filled, 8, filled);
+
+  ctx.fillStyle = 'rgba(233,213,255,0.7)';
+  ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+  ctx.fillText(Math.round(prog * 100) + '%', bx + 4, by - 7);
+
+  // Difficulty badge
+  const hc = difficulty === 'hardcore';
+  ctx.save();
+  ctx.fillStyle = hc ? 'rgba(190,18,60,0.85)' : 'rgba(91,33,182,0.85)';
+  ctx.beginPath(); rr(10, 10, hc ? 106 : 96, 26, 6); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(hc ? '☠  HARDCORE' : '✦  NORMAL', 18, 28);
+  ctx.restore();
+
+  // Touch buttons
+  const btns = [
+    { b: TB.left,  lbl: '◀', on: T.left  },
+    { b: TB.right, lbl: '▶', on: T.right },
+    { b: TB.jump,  lbl: '▲', on: T.jump  },
+  ];
+  for (const { b, lbl, on } of btns) {
+    ctx.save();
+    ctx.globalAlpha = on ? 0.9 : 0.38;
+    ctx.fillStyle   = on ? '#6d28d9' : '#200040';
+    ctx.strokeStyle = '#a855f7'; ctx.lineWidth = on ? 2.5 : 1.5;
+    ctx.shadowColor = '#a855f7'; ctx.shadowBlur = on ? 18 : 4;
+    ctx.beginPath(); rr(b.x, b.y, b.w, b.h, 14); ctx.fill(); ctx.stroke();
+    ctx.globalAlpha = on ? 1 : 0.65;
+    ctx.shadowBlur  = 0;
+    ctx.fillStyle   = '#e9d5ff'; ctx.font = '26px sans-serif';
+    ctx.textAlign   = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(lbl, b.x + b.w/2, b.y + b.h/2 + 1);
+    ctx.restore();
+  }
+}
+
+// ─── SCREENS ─────────────────────────────────────────────────────────────────
+function drawMenuScreen() {
+  // BG
+  ctx.fillStyle = '#08001a'; ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  for (let i = 0; i < 80; i++) {
+    const a = 0.3 + 0.5 * Math.abs(Math.sin(tick * 0.018 + i));
+    ctx.fillStyle = `rgba(210,185,255,${a.toFixed(2)})`;
+    ctx.beginPath(); ctx.arc((i*137.5)%W, (i*83.7)%H, 0.7 + (i%3)*0.4, 0, Math.PI*2); ctx.fill();
+  }
+
+  // Tower silhouette hint
+  ctx.fillStyle = 'rgba(28, 5, 60, 0.7)';
+  ctx.fillRect(TL, 0, TW, H);
+  ctx.fillStyle = 'rgba(50,10,100,0.4)'; ctx.fillRect(0, 0, TL, H);
+  ctx.fillStyle = 'rgba(50,10,100,0.4)'; ctx.fillRect(TR, 0, W-TR, H);
+
+  // Title
+  ctx.save();
+  ctx.shadowColor = '#a855f7'; ctx.shadowBlur = 35;
+  ctx.fillStyle = '#f5f3ff'; ctx.textAlign = 'center';
+  ctx.font = '900 54px Cinzel, serif';
+  ctx.fillText('TOWER', W/2, H/2 - 115);
+  ctx.font = '900 54px Cinzel, serif';
+  ctx.fillStyle = '#c4b5fd';
+  ctx.fillText('ASCENT', W/2, H/2 - 58);
+  ctx.restore();
+
+  ctx.fillStyle = '#7c3aed'; ctx.font = '14px Cinzel, serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('— A Fantasy Climbing Adventure —', W/2, H/2 - 18);
+
+  // Difficulty
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '11px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('DIFFICULTY', W/2, H/2 + 18);
+  menuBtn(W/2 - 95, H/2 + 28, 85, 42, 'NORMAL',   difficulty === 'normal',   '#6d28d9');
+  menuBtn(W/2 + 10, H/2 + 28, 85, 42, 'HARDCORE', difficulty === 'hardcore', '#9f1239');
+
+  // Start
+  const pulse = 0.88 + 0.12 * Math.sin(tick * 0.055);
+  ctx.save(); ctx.globalAlpha = pulse;
+  ctx.shadowColor = '#7c3aed'; ctx.shadowBlur = 24;
+  ctx.fillStyle = '#5b21b6';
+  ctx.beginPath(); rr(W/2 - 88, H/2 + 92, 176, 52, 14); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = '#f3e8ff'; ctx.font = 'bold 17px Cinzel, serif'; ctx.textAlign = 'center';
+  ctx.fillText('BEGIN ASCENT', W/2, H/2 + 124);
+
+  // Info
+  ctx.fillStyle = 'rgba(167,139,250,0.65)'; ctx.font = '11px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('← → Move   ↑ / SPACE Jump', W/2, H/2 + 170);
+
+  if (difficulty === 'normal') {
+    ctx.fillStyle = 'rgba(212,160,23,0.85)';
+    ctx.fillText('✦  Checkpoints active — safe landings', W/2, H/2 + 190);
+  } else {
+    ctx.fillStyle = 'rgba(220,50,60,0.85)';
+    ctx.fillText('☠  Hardcore — fall and climb from the bottom', W/2, H/2 + 190);
+  }
+}
+
+function menuBtn(x, y, w, h, label, sel, col) {
+  ctx.save();
+  ctx.shadowColor = col; ctx.shadowBlur = sel ? 20 : 4;
+  ctx.fillStyle   = sel ? col : 'rgba(20,5,45,0.9)';
+  ctx.strokeStyle = col; ctx.lineWidth = sel ? 2 : 1;
+  ctx.beginPath(); rr(x, y, w, h, 8); ctx.fill(); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle  = sel ? '#fff' : col;
+  ctx.font = `bold ${label.length > 6 ? 9 : 12}px Cinzel, serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + w/2, y + h/2); ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+function handleMenuClick(e) {
+  const pt = e.touches ? (() => { const t = e.touches[0]||e.changedTouches[0]; return cp(t); })() : cp(e);
+  handleMenuTap(pt);
+}
+function handleMenuTap(pt) {
+  if (pt.x >= W/2 - 95 && pt.x <= W/2 - 10 && pt.y >= H/2 + 28 && pt.y <= H/2 + 70) {
+    difficulty = 'normal';
+  } else if (pt.x >= W/2 + 10 && pt.x <= W/2 + 95 && pt.y >= H/2 + 28 && pt.y <= H/2 + 70) {
+    difficulty = 'hardcore';
+  } else if (pt.x >= W/2 - 88 && pt.x <= W/2 + 88 && pt.y >= H/2 + 92 && pt.y <= H/2 + 144) {
+    startGame();
+  }
+}
+canvas.addEventListener('click', e => { if (state === 'menu') handleMenuClick(e); });
+
+function startGame() {
+  genWorld(); resetPlayer(); state = 'playing';
+}
+
+function drawWinScreen() {
+  ctx.fillStyle = 'rgba(8,0,18,0.82)'; ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.shadowColor = '#fde68a'; ctx.shadowBlur = 45;
+  ctx.fillStyle = '#fef9c3'; ctx.font = '900 50px Cinzel, serif'; ctx.textAlign = 'center';
+  ctx.fillText('ASCENDED!', W/2, H/2 - 65);
+  ctx.restore();
+
+  const stars2 = ['✦','★','✦'];
+  ctx.fillStyle = '#fbbf24'; ctx.font = '22px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(stars2.join('  '), W/2, H/2 - 22);
+
+  ctx.fillStyle = '#c4b5fd'; ctx.font = '15px Cinzel, serif'; ctx.textAlign = 'center';
+  ctx.fillText('You have reached the Apex of', W/2, H/2 + 12);
+  ctx.fillText('the Forbidden Tower!', W/2, H/2 + 34);
+
+  const pulse = 0.88 + 0.12 * Math.sin(tick * 0.06);
+  ctx.save(); ctx.globalAlpha = pulse;
+  ctx.shadowColor = '#6d28d9'; ctx.shadowBlur = 22;
+  ctx.fillStyle = '#4c1d95';
+  ctx.beginPath(); rr(W/2 - 95, H/2 + 68, 190, 52, 14); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = '#f5f3ff'; ctx.font = 'bold 16px Cinzel, serif'; ctx.textAlign = 'center';
+  ctx.fillText('ASCEND AGAIN', W/2, H/2 + 100);
+
+  canvas.onclick = e => {
+    const pt = cp(e);
+    if (pt.x >= W/2 - 95 && pt.x <= W/2 + 95 && pt.y >= H/2 + 68 && pt.y <= H/2 + 120) {
+      canvas.onclick = null; state = 'menu';
+    }
+  };
+}
+
+// ─── LOOP ─────────────────────────────────────────────────────────────────────
+function loop() {
+  tick++;
+  update();
+
+  if (state === 'playing') {
+    drawBG(); drawPlatforms(); drawPlayer(); drawHUD();
+  } else if (state === 'menu') {
+    drawMenuScreen();
+  } else if (state === 'win') {
+    drawBG(); drawPlatforms(); drawPlayer(); drawWinScreen();
+  }
+
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
